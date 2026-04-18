@@ -6,7 +6,20 @@ The main goal is simple: give an LLM a faithful, compact picture of what the wor
 
 ## Version
 
-Current documented version: `v1.1`
+Current documented version: `v1.3`
+
+## What v1.3 adds
+
+- Floating textbox extraction for `.xlsx` sheets when text is stored in DrawingML shapes.
+- Sheet-level reporting of textbox names, approximate anchor positions, and extracted text.
+- Updated docs for the current output structure and interactive flow.
+
+## What v1.2 adds
+
+- Manual per-sheet header-row overrides.
+- A new interactive prompt where you can enter overrides like `2:3,5:7`.
+- Metadata rows above a manually specified header are still preserved and described.
+- Every generated Markdown file now starts with a short structure guide for LLMs.
 
 ## What v1.1 adds
 
@@ -30,16 +43,18 @@ For each workbook run, the script writes one Markdown file next to the source wo
 The Markdown file contains:
 
 1. A workbook title
-2. A `## Sheet: ...` section for every worksheet
-3. Sheet-level structural notes such as skipped leading rows or pivot-like metadata blocks
-4. Column-by-column summaries including:
+2. A short preamble explaining how to read the Markdown structure
+3. A `## Sheet: ...` section for every worksheet
+4. Sheet-level structural notes such as skipped leading rows or pivot-like metadata blocks
+5. Floating textboxes or text-bearing drawing shapes, when present on `.xlsx` sheets
+6. Column-by-column summaries including:
    - inferred type
    - null counts
    - unique counts
    - sample values
    - numeric stats where applicable
    - formula notes for `.xlsx` / `.xlsm`
-5. Optional `## Table: ...` sections with full Markdown tables for the selected sheets
+7. Optional `## Table: ...` sections with full Markdown tables for the selected sheets
 
 ## Quick Start
 
@@ -58,13 +73,15 @@ py -3 excel_describer.py
 
 4. Pick a workbook from the menu.
 5. Pick which sheets to tabularize, if any.
-6. Open the generated `.md` file.
+6. Enter any manual header overrides for sheets whose real header row is known.
+7. Open the generated `.md` file.
 
 ## Why this project exists
 
 LLMs are much better with structured text than with opaque Excel binaries. A raw workbook often contains:
 
 - title blocks before the real header
+- floating textboxes with business rules or notes
 - pivot filter rows
 - formulas mixed with displayed values
 - blank spacer rows
@@ -90,17 +107,24 @@ Dumping every sheet as a full Markdown table can create huge outputs. The script
 
 This keeps the default output usable for LLMs while still allowing deep inspection where needed.
 
-### 3. Header detection is heuristic, not schema-driven
+### 3. Header detection is heuristic by default, but overrideable
 
-Real business workbooks often begin with notes, titles, merged headers, or pivot metadata. The script uses a heuristic `find_table_start(...)` instead of assuming row 1 is the true header.
+Real business workbooks often begin with notes, titles, merged headers, pivot metadata, or helper rows. The script uses a heuristic `find_table_start(...)` instead of assuming row 1 is the true header, but it now also lets you override the header row for specific sheets when you already know the correct answer.
 
 That is intentionally pragmatic:
 
 - it works well on messy operational files
 - it avoids hardcoding one workbook layout
 - it accepts that some sheets are not clean tables
+- it gives you a manual escape hatch when heuristics are not enough
 
-### 4. Markdown is the output format on purpose
+### 4. Floating text matters too
+
+Some business workbooks place important instructions in floating textboxes rather than cells. Those objects sit above the grid, so a plain sheet read misses them entirely.
+
+`v1.3` adds a direct `.xlsx` package inspection pass for text-bearing drawing shapes so those notes are not silently lost in the Markdown output.
+
+### 5. Markdown is the output format on purpose
 
 Markdown is:
 
@@ -111,7 +135,7 @@ Markdown is:
 
 The goal is explainability, not perfect spreadsheet reconstruction.
 
-### 5. Legacy `.xls` support is best-effort
+### 6. Legacy `.xls` support is best-effort
 
 Old `.xls` files are supported through `pandas`/`xlrd` for value-level analysis, but not full formula introspection. This tradeoff keeps older files usable without pretending they provide the same fidelity as modern `.xlsx`.
 
@@ -120,15 +144,28 @@ Old `.xls` files are supported through `pandas`/`xlrd` for value-level analysis,
 At a high level, each sheet goes through this pipeline:
 
 1. Load the raw sheet with `header=None`
-2. Guess the header row with `find_table_start(...)`
-3. Detect pivot-like leading rows with `_looks_like_pivot(...)`
-4. Re-parse the sheet using the detected header row
-5. Drop fully empty rows and columns
-6. Normalize unnamed headers to `Unnamed_col_<n>`
-7. Summarize each remaining column
-8. Optionally render selected sheets as raw Markdown tables
+2. Extract floating textboxes from `.xlsx` drawing parts when available
+3. Guess the header row with `find_table_start(...)`, unless a manual override was provided
+4. Detect pivot-like leading rows with `_looks_like_pivot(...)`
+5. Re-parse the sheet using the detected or overridden header row
+6. Drop fully empty rows and columns
+7. Normalize unnamed headers to `Unnamed_col_<n>`
+8. Summarize each remaining column
+9. Optionally render selected sheets as raw Markdown tables
 
 ## Changelog
+
+### v1.3
+
+- Added extraction of floating textbox content from `.xlsx` drawing shapes.
+- Added sheet-level reporting of textbox names, approximate anchor positions, and extracted text.
+- Updated the README to reflect the current interactive flow and output structure.
+
+### v1.2
+
+- Added manual per-sheet header overrides using `sheet_number:header_row` input.
+- Preserved descriptive reporting for metadata rows that appear above a manually forced header row.
+- Added a reusable Markdown structure preamble to each generated output file.
 
 ### v1.1
 
@@ -173,6 +210,17 @@ The header row is inferred, not guaranteed. Sheets with:
 
 can confuse the heuristic. When that happens, the generated description is still useful, but the inferred table start may need a manual sanity check.
 
+You can now correct that case by entering a manual header override during the interactive run.
+
+### Floating textbox extraction is `.xlsx`-only and shape-specific
+
+The textbox pass reads DrawingML text-bearing shapes from modern `.xlsx` packages. That means:
+
+- it helps when the workbook stores notes in floating textboxes
+- it does not apply to legacy `.xls`
+- it does not guarantee extraction from every possible Excel drawing object type
+- comment infrastructure and non-text graphics may still be out of scope
+
 ### Wide sheets can create huge Markdown
 
 If you choose to tabularize a very large sheet, the resulting Markdown can become enormous. That is expected. For LLM usage, it is usually better to tabularize only the sheets you truly need.
@@ -200,6 +248,7 @@ This project intentionally prefers:
 If a workbook is messy, the output should still tell you:
 
 - where the likely data starts
+- whether important floating sheet notes exist outside the cell grid
 - what each column means
 - whether formulas are involved
 - which sheets deserve closer inspection
@@ -209,11 +258,13 @@ If a workbook is messy, the output should still tell you:
 - Business workbooks with one dominant table per sheet
 - Operational reports with a few leading note rows
 - Pivot exports that include filter metadata above the real headers
+- Workbooks that use floating textboxes for exceptions, notes, or business decisions
 - Workbooks you want to summarize before sending to an LLM
 
 ## When to be careful
 
 - Highly formatted presentation sheets
+- Sheets that rely on unsupported drawing object types for important annotations
 - Sheets with merged, multi-row headers
 - Sheets with multiple disconnected table regions
 - Workbooks that depend on fresh Excel recalculation
@@ -248,4 +299,8 @@ Relevant files today:
 
 ## Summary
 
-`v1.1` keeps the original spirit of the tool intact: explain a workbook in a way an LLM can actually use. The main improvement is that raw table rendering is no longer limited to one sheet, which makes the script much more practical on real multi-sheet business workbooks.
+`v1.3` keeps the original spirit of the tool intact: explain a workbook in a way an LLM can actually use. It now covers three common failure points in real files much better than the initial version:
+
+- non-tabular rows before the real header
+- sheets whose header row must be set manually
+- floating textboxes that contain important business context outside the grid

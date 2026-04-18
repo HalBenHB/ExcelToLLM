@@ -4,9 +4,34 @@ from openpyxl.utils import get_column_letter
 from pathlib import Path
 import re
 import sys
+from zipfile import ZipFile
+import posixpath
+import xml.etree.ElementTree as ET
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAX_UNIQUE_DISPLAY = 70
+MARKDOWN_STRUCTURE_NOTE = """## How to Read This Markdown
+
+This file is designed for both humans and LLMs.
+
+- Each `## Sheet: ...` section describes one worksheet.
+- `Table starts at` tells you which Excel row is treated as the real header row.
+- Rows shown in blockquotes above the table description are metadata, notes, filters, fast-calculation rows, or other pre-table content that appeared before the header.
+- Floating textboxes and other text-bearing drawing shapes are listed separately when present.
+- Each `####` subsection describes one detected column, including its Excel column letter, inferred type, null counts, and sample values.
+- If formulas are present, they are shown inline using backticks.
+- If `## Table: ...` sections exist near the end, they contain row-by-row Markdown table exports of the selected sheets.
+
+When a sheet uses a manual header override, that row is trusted as the header even if automatic detection would choose a different starting row.
+"""
+
+XML_NS = {
+    "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "office_rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
 
 
 # ── .xls / .xlsx dispatcher ───────────────────────────────────────────────────
@@ -125,6 +150,183 @@ def prompt_tabularize(sheet_names: list[str]) -> list[str]:
         print(
             f"  x Enter 0, 'a', or sheet numbers/ranges between 1 and {len(sheet_names)}."
         )
+
+
+def parse_header_overrides(raw: str, sheet_names: list[str]) -> dict[str, int] | None:
+    """
+    Parse sheet header overrides in the form `sheet_number:excel_header_row`.
+
+    Example:
+      2:3,5:7  -> sheet 2 uses Excel row 3 as header, sheet 5 uses row 7.
+
+    Returns a mapping of sheet name -> 0-based header row index.
+    """
+    raw = raw.strip().lower()
+    if raw in {"", "0"}:
+        return {}
+
+    overrides: dict[str, int] = {}
+    seen_sheet_numbers: set[int] = set()
+
+    for token in re.split(r"[\s,]+", raw):
+        if not token:
+            continue
+
+        if ":" not in token:
+            return None
+
+        sheet_part, row_part = token.split(":", maxsplit=1)
+        if not sheet_part.isdigit() or not row_part.isdigit():
+            return None
+
+        sheet_number = int(sheet_part)
+        excel_row = int(row_part)
+
+        if sheet_number < 1 or sheet_number > len(sheet_names) or excel_row < 1:
+            return None
+        if sheet_number in seen_sheet_numbers:
+            return None
+
+        seen_sheet_numbers.add(sheet_number)
+        overrides[sheet_names[sheet_number - 1]] = excel_row - 1
+
+    return overrides
+
+
+def prompt_header_overrides(sheet_names: list[str]) -> dict[str, int]:
+    print("\n+-- Manual header row overrides " + "-" * 28)
+    for i, s in enumerate(sheet_names, 1):
+        print(f"|  [{i}] {s}")
+    print("|  Format: sheet_number:header_row")
+    print("|  Example: 2:3,5:7")
+    print("|  [0] No manual overrides")
+    print("+" + "-" * 60)
+    while True:
+        raw = input(
+            "  Enter overrides for sheets whose header row is known: "
+        )
+        overrides = parse_header_overrides(raw, sheet_names)
+        if overrides is not None:
+            return overrides
+        print("  x Enter values like 2:3,5:7 or 0.")
+
+
+def _normalize_zip_target(base_part: str, target: str) -> str:
+    base_dir = posixpath.dirname(base_part)
+    normalized = posixpath.normpath(posixpath.join(base_dir, target))
+    return normalized.lstrip("/")
+
+
+def _load_relationships(zip_file: ZipFile, rels_path: str) -> dict[str, tuple[str, str]]:
+    if rels_path not in zip_file.namelist():
+        return {}
+
+    rels_root = ET.fromstring(zip_file.read(rels_path))
+    relationships: dict[str, tuple[str, str]] = {}
+    for rel in rels_root.findall("pkgrel:Relationship", XML_NS):
+        relationships[rel.attrib["Id"]] = (
+            rel.attrib.get("Type", ""),
+            rel.attrib.get("Target", ""),
+        )
+    return relationships
+
+
+def _extract_shape_text(shape) -> str:
+    paragraphs: list[str] = []
+    for paragraph in shape.findall("xdr:txBody/a:p", XML_NS):
+        fragments = [
+            (node.text or "")
+            for node in paragraph.findall(".//a:t", XML_NS)
+            if (node.text or "").strip()
+        ]
+        if fragments:
+            paragraphs.append("".join(fragments).strip())
+    return "\n".join(paragraphs).strip()
+
+
+def _anchor_to_label(anchor) -> str:
+    if anchor is None:
+        return "unknown position"
+
+    col_node = anchor.find("xdr:col", XML_NS)
+    row_node = anchor.find("xdr:row", XML_NS)
+    if col_node is None or row_node is None:
+        return "unknown position"
+
+    try:
+        col_idx = int(col_node.text or "0")
+        row_idx = int(row_node.text or "0")
+    except ValueError:
+        return "unknown position"
+
+    return f"{get_column_letter(col_idx + 1)}{row_idx + 1}"
+
+
+def extract_sheet_floating_text(file_path: Path, sheet_names: list[str]) -> dict[str, list[dict[str, str]]]:
+    """
+    Extract floating textbox-like drawing content from an .xlsx package.
+
+    Only DrawingML shapes with text bodies are included here. Traditional VML
+    note/comment containers are ignored because they are comment infrastructure,
+    not standalone floating textboxes.
+    """
+    results = {sheet_name: [] for sheet_name in sheet_names}
+
+    with ZipFile(file_path) as zip_file:
+        workbook_root = ET.fromstring(zip_file.read("xl/workbook.xml"))
+        workbook_rels = _load_relationships(zip_file, "xl/_rels/workbook.xml.rels")
+
+        sheet_part_by_name: dict[str, str] = {}
+        for sheet in workbook_root.find("main:sheets", XML_NS):
+            sheet_name = sheet.attrib.get("name")
+            rel_id = sheet.attrib.get(f"{{{XML_NS['office_rel']}}}id")
+            if not sheet_name or not rel_id or rel_id not in workbook_rels:
+                continue
+
+            _, target = workbook_rels[rel_id]
+            sheet_part_by_name[sheet_name] = _normalize_zip_target("xl/workbook.xml", target)
+
+        for sheet_name, sheet_part in sheet_part_by_name.items():
+            if sheet_name not in results:
+                continue
+
+            sheet_filename = posixpath.basename(sheet_part)
+            sheet_rels_path = f"xl/worksheets/_rels/{sheet_filename}.rels"
+            sheet_rels = _load_relationships(zip_file, sheet_rels_path)
+
+            drawing_targets = [
+                target for rel_type, target in sheet_rels.values()
+                if rel_type.endswith("/drawing")
+            ]
+
+            for drawing_target in drawing_targets:
+                drawing_part = _normalize_zip_target(sheet_part, drawing_target)
+                if drawing_part not in zip_file.namelist():
+                    continue
+
+                drawing_root = ET.fromstring(zip_file.read(drawing_part))
+                for anchor_tag in ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor"):
+                    for anchor in drawing_root.findall(f"xdr:{anchor_tag}", XML_NS):
+                        for shape in anchor.findall("xdr:sp", XML_NS):
+                            text = _extract_shape_text(shape)
+                            if not text:
+                                continue
+
+                            c_nv_pr = shape.find("xdr:nvSpPr/xdr:cNvPr", XML_NS)
+                            shape_name = (
+                                c_nv_pr.attrib.get("name", "Unnamed shape")
+                                if c_nv_pr is not None else "Unnamed shape"
+                            )
+                            from_anchor = anchor.find("xdr:from", XML_NS)
+                            results[sheet_name].append(
+                                {
+                                    "name": shape_name,
+                                    "anchor": _anchor_to_label(from_anchor),
+                                    "text": text,
+                                }
+                            )
+
+    return results
 
 
 
@@ -322,6 +524,8 @@ def describe_sheet(
     ws,
     sheet: str,
     is_xls: bool,
+    floating_text_items: list[dict[str, str]] | None = None,
+    manual_header_row_idx: int | None = None,
     max_unique_display: int = 10,
 ) -> str:
     lines = []
@@ -330,19 +534,44 @@ def describe_sheet(
         lines.append("> ℹ️ **Legacy `.xls` format** — formula introspection is unavailable.")
         lines.append("")
 
+    if floating_text_items:
+        lines.append(f"> 🧷 **Floating text objects detected:** {len(floating_text_items)}")
+        for item in floating_text_items:
+            text = item["text"].replace("\r\n", "\n").replace("\r", "\n")
+            text = " / ".join(part.strip() for part in text.split("\n") if part.strip())
+            lines.append(
+                f"> - `{item['name']}` near **{item['anchor']}**: {text}"
+            )
+        lines.append("")
+
     df_raw = xl_pd.parse(sheet, header=None)
 
     if df_raw.empty:
-        lines.append("_[empty sheet — skipped]_")
+        lines.append("_[empty sheet grid — skipped]_")
         return "\n".join(lines)
 
-    header_row_idx = find_table_start(df_raw)
+    if manual_header_row_idx is not None:
+        header_row_idx = manual_header_row_idx
+        header_source = f"manual override (Excel row {header_row_idx + 1})"
+    else:
+        header_row_idx = find_table_start(df_raw)
+        header_source = "auto-detected"
+
+    if header_row_idx >= len(df_raw):
+        header_row_idx = max(len(df_raw) - 1, 0)
+        header_source += " - clamped to last non-empty sheet row"
+
     formula_cells = get_formula_cells(ws)
 
     # ── Pivot / leading-row block ─────────────────────────────────────────
     if header_row_idx > 0:
-        is_pivot = _looks_like_pivot(df_raw, header_row_idx)
-        if is_pivot:
+        is_pivot = manual_header_row_idx is None and _looks_like_pivot(df_raw, header_row_idx)
+        if manual_header_row_idx is not None:
+            lines.append(
+                f"> 🛠️ **Manual header override applied.** "
+                f"Excel row **{header_row_idx + 1}** is treated as the header."
+            )
+        elif is_pivot:
             lines.append(
                 "> 🔄 **Pivot table export detected.**  "
                 "The rows above the header contain report-filter selections "
@@ -371,6 +600,7 @@ def describe_sheet(
     ]
 
     lines.append(f"- **Table starts at:** Excel row {header_row_idx + 1}")
+    lines.append(f"- **Header detection:** {header_source}")
     lines.append(f"- **Shape:** {df.shape[0]} rows × {df.shape[1]} cols")
     lines.append("")
 
@@ -470,7 +700,9 @@ def main() -> None:
             print("  [i] Legacy .xls detected - formula introspection disabled.")
 
         sheet_names = xl_pd.sheet_names
+        floating_text_by_sheet = {} if is_xls else extract_sheet_floating_text(file_path, sheet_names)
         tab_sheets = prompt_tabularize(sheet_names)
+        header_overrides = prompt_header_overrides(sheet_names)
         output_path = file_path.with_suffix(".md")
 
         print(f"\n  Writing -> {output_path.name}")
@@ -478,13 +710,22 @@ def main() -> None:
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {file_path.name}\n\n")
+            f.write(MARKDOWN_STRUCTURE_NOTE + "\n\n")
 
             for sheet_idx, sheet in enumerate(sheet_names, 1):
                 print(f"\n  Sheet {sheet_idx}/{total_sheets}: '{sheet}'")
                 f.write(f"## Sheet: {sheet}\n\n")
 
                 ws = wb[sheet] if wb is not None else None
-                description = describe_sheet(xl_pd, ws, sheet, is_xls, MAX_UNIQUE_DISPLAY)
+                description = describe_sheet(
+                    xl_pd,
+                    ws,
+                    sheet,
+                    is_xls,
+                    floating_text_items=floating_text_by_sheet.get(sheet, []),
+                    manual_header_row_idx=header_overrides.get(sheet),
+                    max_unique_display=MAX_UNIQUE_DISPLAY,
+                )
                 f.write(description + "\n\n")
 
                 progress_bar(sheet_idx, total_sheets, label=f"Sheet '{sheet}' done")
