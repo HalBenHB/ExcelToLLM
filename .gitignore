@@ -1,0 +1,6 @@
+/__pycache__
+*.pyc
+/.idea/
+/generated_test_excels/
+~$*.xlsx
+/tests/_tmp/

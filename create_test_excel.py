@@ -1,15 +1,17 @@
-import pandas as pd
+from __future__ import annotations
 
-# Define a simple dataframe
-data = {
-    'Name': ['Alice', 'Bob', 'Charlie'],
-    'Age': [25, 30, 35],
-    'Date': pd.to_datetime(['2023-01-01', '2023-02-01', '2023-03-01'])
-}
-df = pd.DataFrame(data)
+from pathlib import Path
 
-# Create an Excel file
-with pd.ExcelWriter('test_file.xlsx') as writer:
-    df.to_excel(writer, sheet_name='Sheet1', index=False)
+from excel_describer_lib.test_workbooks import build_all_test_workbooks
 
-print("Created test_file.xlsx")
+
+def main() -> None:
+    output_dir = Path(__file__).resolve().parent / "generated_test_excels"
+    workbook_paths = build_all_test_workbooks(output_dir)
+    print(f"Generated {len(workbook_paths)} workbook(s) in {output_dir}:")
+    for workbook_path in workbook_paths:
+        print(f"- {workbook_path.name}")
+
+
+if __name__ == "__main__":
+    main()
