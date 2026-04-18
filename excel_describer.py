@@ -2,6 +2,7 @@ import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
 from pathlib import Path
+import re
 import sys
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -29,7 +30,7 @@ def load_workbook_safe(file_path: Path):
 
 def progress_bar(current: int, total: int, label: str = "", width: int = 40) -> None:
     filled = int(width * current / total) if total > 0 else width
-    bar = "█" * filled + "░" * (width - filled)
+    bar = "#" * filled + "-" * (width - filled)
     pct = f"{100 * current / total:.0f}%" if total > 0 else "100%"
     print(f"\r  [{bar}] {pct}  {label:<40}", end="", flush=True)
     if current >= total:
@@ -39,37 +40,95 @@ def progress_bar(current: int, total: int, label: str = "", width: int = 40) -> 
 # ── Interactive prompts ───────────────────────────────────────────────────────
 
 def prompt_file_selection(excel_files: list[Path]) -> Path | None:
-    print("\n┌─ Excel files found " + "─" * 40)
+    print("\n+-- Excel files found " + "-" * 40)
     for i, f in enumerate(excel_files, 1):
-        print(f"│  [{i}] {f.name}")
-    print("│  [0] Exit")
-    print("└" + "─" * 60)
+        print(f"|  [{i}] {f.name}")
+    print("|  [0] Exit")
+    print("+" + "-" * 60)
     while True:
         raw = input("  Select a file (number): ").strip()
         if raw == "0":
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(excel_files):
             return excel_files[int(raw) - 1]
-        print(f"  ✗ Enter a number between 0 and {len(excel_files)}.")
+        print(f"  x Enter a number between 0 and {len(excel_files)}.")
 
 
-def prompt_tabularize(sheet_names: list[str]) -> str | None:
-    print("\n┌─ Tabularize a sheet " + "─" * 39)
-    for i, s in enumerate(sheet_names, 1):
-        print(f"│  [{i}] {s}")
-    print("│  [0] Skip — no tabularization")
-    print("└" + "─" * 60)
-    while True:
-        raw = input("  Select a sheet to render as Markdown table (number): ").strip()
-        if raw == "0":
+# ── Tabularization prompt helpers ─────────────────────────────────────────────
+
+def parse_sheet_selection(raw: str, max_index: int) -> list[int] | None:
+    """
+    Parse a 1-based sheet selection string.
+
+    Supported inputs:
+      - 0            -> skip tabularization
+      - a / all      -> select all sheets
+      - 1,3,5        -> individual sheet numbers
+      - 2-4,7        -> inclusive ranges plus individual picks
+    """
+    raw = raw.strip().lower()
+    if raw in {"0", ""}:
+        return []
+    if raw in {"a", "all"}:
+        return list(range(1, max_index + 1))
+
+    selected: list[int] = []
+    seen: set[int] = set()
+
+    for token in re.split(r"[\s,]+", raw):
+        if not token:
+            continue
+
+        if "-" in token:
+            parts = token.split("-", maxsplit=1)
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                return None
+
+            start, end = map(int, parts)
+            if start > end or start < 1 or end > max_index:
+                return None
+
+            for idx in range(start, end + 1):
+                if idx not in seen:
+                    selected.append(idx)
+                    seen.add(idx)
+            continue
+
+        if not token.isdigit():
             return None
-        if raw.isdigit() and 1 <= int(raw) <= len(sheet_names):
-            return sheet_names[int(raw) - 1]
-        print(f"  ✗ Enter a number between 0 and {len(sheet_names)}.")
+
+        idx = int(token)
+        if idx < 1 or idx > max_index:
+            return None
+        if idx not in seen:
+            selected.append(idx)
+            seen.add(idx)
+
+    return selected
+
+
+def prompt_tabularize(sheet_names: list[str]) -> list[str]:
+    print("\n+-- Tabularize sheet tables " + "-" * 33)
+    for i, s in enumerate(sheet_names, 1):
+        print(f"|  [{i}] {s}")
+    print("|  [a] All sheets")
+    print("|  [0] Skip - no tabularization")
+    print("+" + "-" * 60)
+    while True:
+        raw = input(
+            "  Select sheet(s) to render as Markdown tables "
+            "(e.g. 1,3-4 / a / 0): "
+        )
+        selected = parse_sheet_selection(raw, len(sheet_names))
+        if selected is not None:
+            return [sheet_names[i - 1] for i in selected]
+        print(
+            f"  x Enter 0, 'a', or sheet numbers/ranges between 1 and {len(sheet_names)}."
+        )
+
 
 
 # ── Cell sanitiser ────────────────────────────────────────────────────────────
-
 def _sanitize_cell(value: str) -> str:
     """Collapse newlines to <br> and escape pipes so Markdown table rows stay intact."""
     value = value.replace("\r\n", "<br>").replace("\r", "<br>").replace("\n", "<br>")
@@ -408,13 +467,13 @@ def main() -> None:
         wb, is_xls = load_workbook_safe(file_path)
 
         if is_xls:
-            print("  ℹ  Legacy .xls detected — formula introspection disabled.")
+            print("  [i] Legacy .xls detected - formula introspection disabled.")
 
         sheet_names = xl_pd.sheet_names
-        tab_sheet = prompt_tabularize(sheet_names)
+        tab_sheets = prompt_tabularize(sheet_names)
         output_path = file_path.with_suffix(".md")
 
-        print(f"\n  Writing → {output_path.name}")
+        print(f"\n  Writing -> {output_path.name}")
         total_sheets = len(sheet_names)
 
         with open(output_path, "w", encoding="utf-8") as f:
@@ -430,18 +489,23 @@ def main() -> None:
 
                 progress_bar(sheet_idx, total_sheets, label=f"Sheet '{sheet}' done")
 
-            if tab_sheet:
-                print(f"\n  Rendering sheet '{tab_sheet}' as Markdown table…")
+            if tab_sheets:
                 f.write("---\n\n")
-                f.write(f"## Table: {tab_sheet}\n\n")
-                ws = wb[tab_sheet] if wb is not None else None
-                md_table = tabularize_sheet(ws, xl_pd, tab_sheet, is_xls)
-                f.write(md_table + "\n")
+                total_tables = len(tab_sheets)
+                for table_idx, tab_sheet in enumerate(tab_sheets, 1):
+                    print(
+                        f"\n  Rendering table {table_idx}/{total_tables}: "
+                        f"'{tab_sheet}' as Markdown table..."
+                    )
+                    f.write(f"## Table: {tab_sheet}\n\n")
+                    ws = wb[tab_sheet] if wb is not None else None
+                    md_table = tabularize_sheet(ws, xl_pd, tab_sheet, is_xls)
+                    f.write(md_table + "\n")
 
-        print(f"\n  ✓ Written to {output_path.name}")
+        print(f"\n  [ok] Written to {output_path.name}")
 
     except Exception as e:
-        print(f"\n  ✗ Error processing {file_path.name}: {e}")
+        print(f"\n  [x] Error processing {file_path.name}: {e}")
         raise
 
 
